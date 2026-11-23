@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-26, target: aarch64-apple-darwin, arch: arm64, bundles: 'app,dmg', name: macOS-AppleSilicon-arm64 }
+          - { os: macos-15-intel, target: aarch64-apple-darwin, arch: arm64, bundles: 'app,dmg', name: macOS-AppleSilicon-arm64, cross: true }
           - { os: macos-15-intel, target: x86_64-apple-darwin, arch: x86_64, bundles: 'app,dmg', name: macOS-Intel-x64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, bundles: 'msi,nsis', name: Windows-x64 }
     runs-on: ${{ matrix.os }}
@@ -53,9 +53,11 @@ jobs:
 
       - name: Pruebas
         shell: bash
+        # Apple Silicon is built on an Intel Mac (GitHub's Apple Silicon machines are often full): its FFmpeg cannot
+        # run there, so the Rust tests run in the Intel build of the same code
         run: |
           npx vitest run
-          cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+          if [ "${{ matrix.cross }}" != "true" ]; then cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture; fi
         env:
           TACTICJG_FFMPEG_DIR: ${{ github.workspace }}/src-tauri/binaries
 
