@@ -1,0 +1,159 @@
+# TACTICJG — compilación de los instaladores y de las actualizaciones, en este repositorio PÚBLICO (minutos gratis).
+# El código NO está aquí: se descarga del repositorio privado JGanalisis/TACTICJG con el secreto CODIGO_TOKEN.
+# Aquí solo quedan los instaladores y las actualizaciones firmadas (secreto TAURI_SIGNING_PRIVATE_KEY).
+# Se lanza a mano: Actions → Compilar TACTICJG → Run workflow.
+name: Compilar TACTICJG
+on:
+  workflow_dispatch:
+    inputs:
+      rama:
+        description: 'Rama del código (JGanalisis/TACTICJG)'
+        type: string
+        default: integracion-preinstalador
+      publicar:
+        description: 'Publicar como actualización'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-26, target: aarch64-apple-darwin, arch: arm64, bundles: 'app,dmg', name: macOS-AppleSilicon-arm64 }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, arch: x86_64, bundles: 'app,dmg', name: macOS-Intel-x64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, bundles: 'msi,nsis', name: Windows-x64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: JGanalisis/TACTICJG
+          ref: ${{ inputs.rama }}
+          token: ${{ secrets.CODIGO_TOKEN }}
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: '${{ matrix.target }}' }
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+      - run: npm ci
+
+      - name: FFmpeg LGPL (macOS, desde el código fuente)
+        if: runner.os == 'macOS'
+        run: |
+          brew install nasm pkg-config
+          scripts/build-ffmpeg-macos.sh ${{ matrix.arch }}
+      - name: FFmpeg incluido (comprueba que no sea GPL)
+        run: node scripts/fetch-ffmpeg.mjs --target ${{ matrix.target }}
+
+      - name: Pruebas
+        shell: bash
+        run: |
+          npx vitest run
+          cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+        env:
+          TACTICJG_FFMPEG_DIR: ${{ github.workspace }}/src-tauri/binaries
+
+      # Signing only when the secrets exist: an empty APPLE_CERTIFICATE would make the build try (and fail) to sign.
+      - name: Firma (solo si hay secretos)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          C: ${{ secrets.APPLE_CERTIFICATE }}
+          CP: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SI: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          AI: ${{ secrets.APPLE_ID }}
+          AP: ${{ secrets.APPLE_PASSWORD }}
+          AT: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$C" ]; then
+            { echo "APPLE_CERTIFICATE=$C"; echo "APPLE_CERTIFICATE_PASSWORD=$CP"; echo "APPLE_SIGNING_IDENTITY=$SI"; } >> "$GITHUB_ENV"
+            [ -n "$AI" ] && { echo "APPLE_ID=$AI"; echo "APPLE_PASSWORD=$AP"; echo "APPLE_TEAM_ID=$AT"; } >> "$GITHUB_ENV"
+            echo "Instalador firmado"
+          else
+            echo "Sin certificado: instalador sin firmar"
+          fi
+
+      # Each build gets its own version (0.7.<run>, above the 0.6.x built before): the installed apps compare it to offer the update
+      - name: Versión
+        shell: bash
+        run: |
+          V="0.7.${{ github.run_number }}"
+          node -e "const f='src-tauri/tauri.conf.json',fs=require('fs'),c=JSON.parse(fs.readFileSync(f));c.version='$V';fs.writeFileSync(f,JSON.stringify(c,null,2))"
+          echo "Versión $V"
+
+      # With the signing key (secret TAURI_SIGNING_PRIVATE_KEY) the build also makes the signed update files;
+      # without it, the installers only (the app then never offers this build as an update)
+      - name: Instaladores
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          else
+            echo "Sin llave de actualizaciones: solo instaladores"
+            npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          fi
+
+      - name: Huellas SHA-256
+        shell: bash
+        run: |
+          cd src-tauri/target/${{ matrix.target }}/release/bundle
+          find . -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' \) -exec shasum -a 256 {} \; | tee SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TACTICJG-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/SHA256SUMS.txt
+
+  # Publish the build as an update: installers + signed update files + latest.json, as a release of this repository
+  publicar:
+    needs: build
+    runs-on: ubuntu-latest
+    if: inputs.publicar
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Publicar actualización
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: 0.7.${{ github.run_number }}
+          REPO: ${{ github.repository }}
+          RAMA: ${{ inputs.rama }}
+        run: |
+          mkdir pub
+          for f in dist/*/dmg/*.dmg dist/*/msi/*.msi dist/*/nsis/*-setup.exe dist/*/nsis/*-setup.exe.sig; do [ -f "$f" ] && cp "$f" pub/; done
+          for d in dist/TACTICJG-macOS-*; do
+            arch=$(case "$d" in *AppleSilicon*) echo aarch64;; *) echo x86_64;; esac)
+            for f in "$d"/macos/*.app.tar.gz "$d"/macos/*.app.tar.gz.sig; do [ -f "$f" ] && cp "$f" "pub/TACTICJG_${V}_${arch}.app.tar.gz${f##*.app.tar.gz}"; done
+          done
+          ls -la pub
+          node -e '
+            const fs = require("fs"), V = process.env.V, base = `https://github.com/${process.env.REPO}/releases/download/v${V}/`;
+            const sig = (f) => fs.existsSync("pub/" + f + ".sig") ? fs.readFileSync("pub/" + f + ".sig", "utf8").trim() : null;
+            const win = fs.readdirSync("pub").find((f) => f.endsWith("-setup.exe"));
+            const platforms = {};
+            for (const [key, file] of [["darwin-aarch64", `TACTICJG_${V}_aarch64.app.tar.gz`], ["darwin-x86_64", `TACTICJG_${V}_x86_64.app.tar.gz`], ["windows-x86_64", win]])
+              if (file && sig(file)) platforms[key] = { signature: sig(file), url: base + encodeURIComponent(file) };
+            if (!Object.keys(platforms).length) { console.log("Sin archivos firmados (falta TAURI_SIGNING_PRIVATE_KEY): no se publica la actualización"); process.exit(0); }
+            fs.writeFileSync("pub/latest.json", JSON.stringify({ version: V, notes: `TACTICJG ${V}`, pub_date: new Date().toISOString(), platforms }, null, 2));
+            console.log(fs.readFileSync("pub/latest.json", "utf8"));'
+          gh release create "v$V" pub/* -R "$REPO" --title "TACTICJG $V" --notes "Versión $V generada desde la rama $RAMA."
